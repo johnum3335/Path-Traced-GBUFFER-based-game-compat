@@ -22,7 +22,7 @@ The Last of us 2 issues
 <br>
 *some indoor areas will be completely dark
 <br>
-*eyes sometimes glow up under certain conditions, most objects with transparency dont get darkened
+*eyes and hair sometimes glow up under certain conditions, most objects with transparency dont get darkened
 <br>
 <br>
 Silent hill 2 remake issues
