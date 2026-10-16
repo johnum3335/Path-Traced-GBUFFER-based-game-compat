@@ -24,7 +24,7 @@ The Last of us 2 issues
 <br>
 *eyes and hair sometimes glow up under certain conditions, most objects with transparency dont get darkened
 <br>
-skin seems to lack subsurface scattering or its original shading is not being properly converted, same applies to hair.
+*skin seems to lack subsurface scattering or its original shading is not being properly converted, same applies to hair.
 <br>
 <br>
 Silent hill 2 remake issues
