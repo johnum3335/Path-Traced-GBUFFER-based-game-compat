@@ -1,5 +1,5 @@
 # Path-Traced-GBUFFER-based-game-compat
-RTXPT Renderer based path tracer that hooks on game's g-buffer
+RTXPT Renderer that hooks on game's g-buffer
 <br>
 <br>
 currently only works on The Last of Us Part II remastered (most of the work) and Silent Hill 2 remake (early work)
