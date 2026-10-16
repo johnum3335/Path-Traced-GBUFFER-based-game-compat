@@ -1,10 +1,12 @@
 # Path-Traced-GBUFFER-based-game-compat
 RTXPT Renderer based path tracer that hooks on game's g-buffer constants.
 <br>
+<br>
 currently only works on The Last of Us Part II remastered (most of the work) and Silent Hill 2 remake (early work)
 Resident evil requiem was used as a guess for how ray reconstruction would denoise the image. <br> DO NOT use it as a renderer on TLOU2
 <br>
 vibe-coded with claude.
+<br>
 <br>
 The Last of us 2 issues
 
