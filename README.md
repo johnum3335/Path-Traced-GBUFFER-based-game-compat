@@ -28,3 +28,7 @@ The Last of us 2 issues
 Silent hill 2 remake issues
 <br>
 *currently WIP
+<br>
+<br>
+Install reshade 6.8 or newer with addon support then extract the files to game exe
+
