@@ -26,6 +26,8 @@ The Last of us 2 issues
 <br>
 *skin seems to lack subsurface scattering or its original shading is not being properly converted, same applies to hair.
 <br>
+*eye fix has made water and mirrors pixelated
+<br>
 <br>
 Silent hill 2 remake issues
 <br>
