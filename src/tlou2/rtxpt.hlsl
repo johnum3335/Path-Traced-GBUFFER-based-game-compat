@@ -1,0 +1,947 @@
+// TLOU RT - the RTXPT renderer (v98): NVIDIA RTXPT's path tracer in the Renderer setting's second slot (v52-v97: DD2's).
+// NVIDIA RTXPT (github.com/NVIDIA-RTX/RTXPT; ..\deps\rtxpt holds its Rtxpt\Shaders\PathTracer unmodified - NVIDIA RTX SDKs
+// license: it ships in object code only, never as source). "This software contains source code provided by NVIDIA
+// Corporation." Taken from it as is: the material model (StandardBSDF - Falcor's: Frostbite diffuse, GGX with visible-normal
+// sampling and height-correlated Smith masking, Schlick's Fresnel, delta lobes below alpha 0.0064), the shading frame
+// (ShadingData), the sampling (Owen-scrambled Sobol for the BSDF until the first diffuse bounce, hashes after). Derived from
+// its PathTracer.hlsli (reference mode: GenerateScatterRay / HandleHit / HandleMiss / HandleRussianRoulette): one path a
+// pixel, a BSDF sample at every vertex, next-event estimation at every vertex with a non-delta lobe, RTXPT's bounce limits
+// (BounceCount 20; DiffuseBounceCount: the Bounces setting - a scatter counts as diffuse on a diffuse lobe or above roughness
+// 0.25) and its Russian roulette (sqrt of the throughput's luminance, survivors' throughput / the survival chance from the
+// next vertex's NEE on; a path it stops still takes its ray's sky). v99 (user, v98: "light handling seems to be the same?";
+// "yes i want that, go" - RTXPT's light handling, physical falloff): the lights as RTXPT's sphere lights (SphereLight: the
+// light uniform over the solid angle its sphere subtends - the game's lights at their radius, at least Light size's, the
+// lamps at their visible area - each sample toward a point of its sphere, the shadow ray too: shadows soft by the light's
+// size) with Physical light falloff (rt.hlsl light_arrival_ex: inverse-square from the intensity that keeps each light's
+// energy within its authored range; their cones, cookies and shades kept), and RTXPT's next-event estimation at every
+// vertex (PathTracerNEE.hlsli: 5 candidates - 65 % from the local distribution, RTXPT's NEE-AT screen tiles, here the
+// vertex's ReGIR surface cell, the rest from the global one, RTXDI's power PDF - weighted reservoir sampling by the light x
+// the BSDF's pdf, one shadow-tested sample); at the primary ReSTIR DI's pick (cs_rtxdi_di) re-shaded with RTXPT's BSDF and
+// the light's sphere while Ray Reconstruction does not denoise, RTXPT's NEE while it does (RTXPT's DisableReSTIRsWithDLSSRR:
+// RR takes uncorrelated noise). The sun: one ray in its cone (the game's shadow mask where the camera sees the vertex); the
+// sky on a miss (re9.hlsl dd2_escaped). None of them is a surface a BSDF ray can find (the lamps are the game's emissive
+// pixels kept as lights, the game's lights spheres without geometry), so light sampling alone carries them - RTXPT's MIS
+// weight is 1 then. Unlike DD2's renderer: no light from the game's lighting at the hits (seen light, SHaRC, baked light at
+// the first hit off screen), no contact ray, the roughness free to decrease along the path. The outputs as DD2's renderer
+// left them (re9.hlsl's accumulation, RR's inputs and the composite below read them): the primary's direct light, the
+// indirect light demodulated per lobe - the primary's sample weight (FalcorBSDF.sample's: the sampled lobe's f cos / its
+// pdf) over that lobe's albedo (re9_albedos' Ad / As), which the composite multiplies back.
+#include "re9.hlsl"
+
+#define PATH_TRACER_MODE 0                                  // RTXPT's PATH_TRACER_MODE_REFERENCE: no stable planes
+#include "PathTracer/Config.h"
+#include "PathTracer/PathTracerTypes.hlsli"
+
+#define PT_BOUNCE_COUNT 20u                                 // RTXPT's BounceCount (SampleUI.h default)
+#define PT_LIGHT_ROULETTE 1e-3                              // v104: a game light's light (before its shadow) under which its shadow is a roulette
+#define PT_SPECULAR_ROUGHNESS 0.25                          // RTXPT's kSpecularRoughnessThreshold: above it a scatter is diffuse
+
+// A path vertex as RTXPT's Bridge::loadSurface hands it to the path tracer (its Donut bridge's set-up): the shading frame -
+// camera-relative position, toward the previous vertex, the shading normal with a tangent frame around it (no tangents here:
+// perp_stark), the triangle's normal on that side - and the metal-rough material as Donut converts it: diffuse base x
+// (1 - metal), specular lerp(F0, base, metal) (TLOU's dielectric F0: the G-buffer's specular byte, the material cache's),
+// the perceptual roughness (alpha its square); reflection lobes only (TLOU's data has no transmission)
+struct pt_vertex
+{
+	ShadingData sd;
+	StandardBSDF bsdf;
+};
+pt_vertex pt_vertex_make(float3 p, float3 v, float3 n, float3 ng, float3 base, float metal, float f0, float roughness)
+{
+	pt_vertex x;
+	x.sd = ShadingData::make();
+	x.sd.posW = p;
+	x.sd.V = v;
+	x.sd.N = n;
+	x.sd.faceNCorrected = ng;
+	x.sd.vertexN = ng;
+	x.sd.frontFacing = true;
+	x.sd.mtl.setActiveLobes((uint)LobeType::Reflection);
+	x.sd.IoR = 1.0;
+	computeTangentSpace(x.sd, float4(0.0, 0.0, 0.0, 0.0), true);
+	x.bsdf = StandardBSDF::make(StandardBSDFData::make((lpfloat3)(base * (1.0 - metal)), (lpfloat3)lerp(f0.xxx, base, metal),
+		(lpfloat)roughness, (lpfloat)metal, (lpfloat)(1.0 / 1.5), (lpfloat3)0.0, (lpfloat)0.0, (lpfloat)0.0));
+	return x;
+}
+
+// RTXPT's BSDF toward l, its diffuse and specular reflection lobes apart (FalcorBSDF.eval's two terms, f cos each), the
+// specular one with a roughness floor (a game's light's minimum roughness, 0 for the rest)
+void pt_eval(pt_vertex x, float3 l, float min_roughness, out float3 fd, out float3 fs)
+{
+	StandardBSDFData data = x.bsdf.data;
+	data._roughness = (lpfloat)max((float)data._roughness, min_roughness);
+	FalcorBSDF b = FalcorBSDF::make(x.sd, data);
+	const float3 wi = x.sd.toLocal(x.sd.V), wo = x.sd.toLocal(l);
+	fd = b.pDiffuseReflection > 0.0 ? (float3)b.diffuseReflection.eval(wi, wo) : 0.0;
+	fs = b.pSpecularReflection > 0.0 ? (float3)b.specularReflection.eval(wi, wo) : 0.0;
+}
+
+// The sun toward a vertex (DD2's [3b], as both renderers had it): one ray toward a direction of its cone (Sun softness),
+// RTXPT's f cos there; TLOU's light units (the game's Lambert: colour x N.L x albedo) x pi
+float3 pt_sun(pt_vertex x, float3 sun, float3 from, float2 xi, out float vis)
+{
+	vis = 0.0;
+	const float3 l = cone_direction(c[6].xyz, g_sun_cos, xi);
+	float3 fd, fs;
+	pt_eval(x, l, 0.0, fd, fs);
+	if (!any(fd + fs > 0.0))
+		return 0.0;
+	vis = sun_visible(from, l, SUN_RAY_LENGTH);
+	return sun * K_PI * (fd + fs);
+}
+
+// v99: Physical light falloff (g_pass bit 6; RTXDI's weights see it in the frame's flags: RTXDI_FRAME_PHYSICAL)
+bool pt_physical()
+{
+	return (g_pass & 64u) != 0u;
+}
+// v101 (user: "a slider to get it to re9's shadow accuracy would be ideal to control it, as well as light samples"): Light
+// softness (g_pass bits 8-14, 0-100 %) - how far over its sphere a light's samples and shadow rays spread (0: its centre, a
+// point light's hard shadow as RE9's lamps had; 100 %: its own size, the penumbra); its light stays the sphere's - and Light
+// samples (bits 16-19, 1-8): RTXPT's NEEFullSamples at the camera's surfaces
+float pt_softness()
+{
+	return float(min((g_pass >> 8) & 127u, 100u)) * 0.01;
+}
+uint pt_light_samples()
+{
+	return clamp((g_pass >> 16) & 15u, 1u, 8u);
+}
+
+// v99: a light of the frame as an RTXPT sphere light at a path vertex (p relative to the camera) - RTXPT's SphereLight: the
+// light uniform over the solid angle its sphere subtends, uv picking a direction there (SphereLight::CalcSample's uniform
+// cone; a game's light's shadow ray aims the same way: rt.hlsl light_visibility), E its light at normal incidence (its
+// radiance x that solid angle: the estimate is E x RTXPT's f cos toward l), in the light buffer's units before the
+// lighting's factor
+struct pt_light
+{
+	float3 E;
+	float3 l;
+	float3 pos;             // its centre (relative to the camera: the ReGIR visibility cache's record)
+	float cone;             // v101: the radius its samples spread over (its own x Light softness)
+	float tmax;             // a lamp's shadow ray: short of its own surface (emit_skip)
+	float min_roughness;    // a game's light's specular roughness floor
+	uint game;              // the game's light record + 1 (0: a lamp)
+	bool diffuse, specular; // its switches
+};
+bool pt_light_at(RAB_LightInfo info, float3 p, float2 uv, bool primary, surface s, float3 post, out pt_light pl)
+{
+	pl = (pt_light)0;
+	if (info.game != 0u)
+	{
+		// a game's light: the rules the vertex takes (the G-buffer's stencil and character rules at the primary, the ones every
+		// bounce hit takes), its authored shape (cones, box, cookie, lamp shade, near fade) and its distance falloff - the
+		// sphere light's with Physical light falloff, else the game's curve (rt.hlsl light_arrival_ex); its sphere: its radius,
+		// at least Light size's; TLOU's light units x pi
+		const LightDesc L = Lights[info.game - 1u];
+		if (primary ? !dd2_light_takes(L, s) : ((L.flags & 0x80u) == 0u || (L.flags & 0x404E020u) != 0u))
+			return false;
+		float3 color, lc;
+		float dist;
+		if (!light_arrival_ex(L, p, pt_physical(), color, lc, dist))
+			return false;
+		float3 dir;
+		float dl;
+		light_ray(L, p + c[9].xyz, dir, dl);
+		pl.cone = max(L.radius, g_light_radius) * pt_softness();
+		pl.l = (L.flags & 0x4Fu) != 0x41u && pl.cone > 0.0 && dl > pl.cone ? cone_direction(dir, sqrt(1.0 - (pl.cone / dl) * (pl.cone / dl)), uv) : dir;
+		pl.E = color * K_PI;
+		pl.pos = L.position - c[9].xyz;
+		pl.min_roughness = L.min_roughness;
+		pl.game = info.game;
+		pl.diffuse = (L.flags & 128u) != 0u;
+		pl.specular = (L.flags & 256u) != 0u;
+		return any(pl.E > 0.0);
+	}
+	if (!(info.area > 0.0))
+		return false;
+	// a lamp: a sphere of its visible area, its radiance x Lights (after the lighting's factor: / post) x the cardioid around
+	// the side it shines toward (v67's emission profile)
+	pl.pos = info.centre - c[9].xyz;
+	const float3 dv = pl.pos - p;
+	const float d = length(dv);
+	if (!(d > 0.05))
+		return false;
+	const float3 dir = dv / d;
+	const float r = sqrt(info.area * 0.31830989);
+	pl.cone = r * pt_softness();
+	pl.l = pl.cone > 0.0 && d > pl.cone ? cone_direction(dir, sqrt(1.0 - (pl.cone / d) * (pl.cone / d)), uv) : dir;
+	pl.E = info.Le * (g_emit * (0.5 + 0.5 * dot(unpack_normal(info.normal), -dir)) * info.area * sphere_light_falloff(d, r)) / post;
+	pl.tmax = d - emit_skip(info.area, d);
+	pl.diffuse = true;
+	pl.specular = true;
+	return any(pl.E > 0.0);
+}
+// RTXPT's BSDF toward a light's sample (f cos; its switches, its roughness floor) x its light
+float3 pt_light_shade(pt_vertex x, pt_light pl)
+{
+	float3 fd, fs;
+	pt_eval(x, pl.l, pl.min_roughness, fd, fs);
+	return pl.E * ((pl.diffuse ? fd : 0.0) + (pl.specular ? fs : 0.0));
+}
+// A light sample's shadow from origin (off the vertex's surface s): a game's light - its shadow map (the lighting's filter at
+// the primary, one tap at a hit) and light_visibility's ray by Light shadows (none on characters for a light with a map at
+// the primary: the game's, v71's rule); a lamp - its ray. Recorded in ReGIR's visibility cache (v93) as RTXDI's rays are
+float pt_light_shadow(pt_light pl, float2 uv, bool primary, surface s, float3 origin)
+{
+	float vis = 1.0;
+	if (pl.game != 0u)
+	{
+		const LightDesc L = Lights[pl.game - 1u];
+		const float sh = primary ? game_light_shadow(L, s) : (L.shadow_map != -1 ? game_shadow_map(L, s, false) : 1.0);
+		if (!(sh > 0.0) || g_light_shadows <= 0.0 || (primary && L.shadow_map != -1 && s.character))
+			return max(sh, 0.0);
+		const float ray = light_visibility_cone(s, origin, L, uv, pl.cone);   // (v101: the shading's sphere)
+		regir_vis_record(s.p, s.ng, pl.pos, ray > 0.0);
+		return sh * lerp(1.0, ray, g_light_shadows);
+	}
+	if (pl.tmax > 0.0)
+	{
+		vis = trace_visible(origin, pl.l, pl.tmax);
+		regir_vis_record(s.p, s.ng, pl.pos, vis > 0.0);
+	}
+	return vis;
+}
+
+// A light's share of a ReGIR surface cell's slots (cell: its byte offset) - the local distribution's pdf of it (a uniform
+// slot; slots without a light pick nothing)
+float pt_cell_share(uint cell, uint light)
+{
+	uint n = 0u;
+	[unroll]
+	for (uint j = 0u; j < REGIR_CELL_SLOTS; j += 2u)
+	{
+		const uint4 q = Data.Load4(cell + 16u + j * 8u);
+		n += q.x == light && asfloat(q.y) > 0.0 ? 1u : 0u;
+		n += q.z == light && asfloat(q.w) > 0.0 ? 1u : 0u;
+	}
+	return float(n) / float(REGIR_CELL_SLOTS);
+}
+
+// HandleNEE over RTXDI's list (the lamps; the game's lights while RTXDI_FRAME_GAME) - RTXPT's next-event estimation
+// (PathTracerNEE.hlsli GenerateLightSample / ProcessLightSample, derived): NEECandidateSamples (5) candidates,
+// NEEAT_LocalToGlobalSampleRatio (0.65) of them from the local distribution - RTXPT's NEE-AT screen tiles, here the vertex's
+// ReGIR surface cell, its 32 slots as the proxy list (none without a cell filled this frame: all global) - the rest from
+// the global one, RTXDI's power PDF with the game lights' share (rtxdi.hlsli regir_source); RTXPT's weighted reservoir
+// sampling by EvalSampleWeight (the light's largest channel x the BSDF's pdf toward it), each candidate over both
+// distributions (the balance heuristic over the candidate counts: exact pdfs); full samples (NEEFullSamples), each with its
+// shadow ray (lamps clamped as rtxdi_lamps_at clamps them). v100 (user, v99: "without rtxdi the meshes are now showing the
+// black glitch again" - v74's blotch: the light the weights favour blocked from there, Ellie's head over a lamp, picked most
+// frames and its shadow ray black; RTXDI's ReSTIR DI checks visibility as it reuses): the weights x the chance the light is
+// seen from there (ReGIR's visibility cache, regir_vis.hlsli - fed by these shadow rays too; never below its floor: no light
+// is dropped), as RTXPT's NEE-AT learns its local lights from its shadow rays' feedback (InsertFeedbackFromNEE)
+// v104: lamps_only - the game's lights are lit exactly by the caller (the camera's surfaces): candidates that are game lights
+// count for nothing, the global ones drawn by power alone (no game share), so the estimate is the lamps' light. v106: and
+// the lamps the caller lit exactly (ex0 / ex1, pt_lamps_top) count for nothing either - the estimate is the rest's light
+#define PT_NEE_CANDIDATES 5u
+#define PT_NEE_LOCAL_SHARE 0.65                             // RTXPT's NEEAT_LocalToGlobalSampleRatio
+#define PT_NO_LAMP 0xFFFFFFFFu
+
+// v106: the candidates' two sources for a vertex - its ReGIR surface cell's slots (local) and RTXDI's power PDF (global) -,
+// split by the share for a given count of candidates
+struct pt_draw
+{
+	uint cell;              // the cell's byte offset in Data (0: none filled this frame - all global)
+	uint local, global;     // candidates from each
+	regir_source src;
+	RTXDI_RandomSamplerState rng;
+};
+pt_draw pt_draw_init(pt_vertex x, bool lamps_only, uint candidates, inout UniformSampleSequenceGenerator sg)
+{
+	pt_draw d;
+	d.cell = regir_cells_find(x.sd.posW, x.sd.faceNCorrected);
+	d.local = d.cell != 0u ? uint(round(PT_NEE_LOCAL_SHARE * float(candidates))) : 0u;
+	d.global = candidates - d.local;
+	d.rng = RTXDI_CreateRandomSamplerFromDirectSeed(sg.Next(), 1u);
+	RTXDI_RandomSamplerState tile_rng = RTXDI_CreateRandomSamplerFromDirectSeed(sg.Next(), 1u);
+	d.src = regir_source_init(RTXDI_InitializeLocalLightSelectionContextRIS(tile_rng, g_rtxdi.localRis), true);
+	if (lamps_only)
+		d.src.share = 0.0;
+	return d;
+}
+// Candidate i (the local ones first): its light and its pdf under both sources (the balance heuristic over the counts);
+// false: none (an empty slot, outside the list or, lamps_only, a game's light)
+bool pt_draw_next(inout pt_draw d, uint i, bool lamps_only, inout UniformSampleSequenceGenerator sg, out uint light, out float pdf)
+{
+	light = 0u;
+	pdf = 0.0;
+	bool valid = true;
+	if (i < d.local)
+	{
+		const uint2 slot = Data.Load2(d.cell + 16u + min(uint(sampleNext1D(sg) * REGIR_CELL_SLOTS), REGIR_CELL_SLOTS - 1u) * 8u);
+		light = slot.x;
+		valid = asfloat(slot.y) > 0.0;
+	}
+	else
+	{
+		RAB_LightInfo unused;
+		float inv_pdf;
+		regir_source_next(d.src, d.rng, light, unused, inv_pdf);
+		valid = inv_pdf > 0.0;
+	}
+	if (!valid || light >= (lamps_only ? rtxdi_lamps_used(false) : rtxdi_light_count(false)))
+		return false;
+	pdf = float(d.local) * (d.local != 0u ? pt_cell_share(d.cell, light) : 0.0) + float(d.global) * regir_source_pdf(d.src, light);
+	return pdf > 0.0;
+}
+bool pt_excluded(uint light, uint4 ex0, uint4 ex1)
+{
+	return any(ex0 == light) || any(ex1 == light);
+}
+// A lamp's clamp (rtxdi_lamps_at's: its light on the surface at most EMIT_MAX_IRRADIANCE x Lights / pi, after the lighting's
+// factor)
+float3 pt_lamp_cap(float3 light, float3 post)
+{
+	const float le = restir_lum(light * post), cap = 0.31830989 * g_emit * EMIT_MAX_IRRADIANCE;
+	return le > cap ? light * (cap / le) : light;
+}
+
+float3 pt_nee(pt_vertex x, bool primary, surface s, float3 origin, float3 post, uint full, bool lamps_only, uint4 ex0, uint4 ex1,
+	inout UniformSampleSequenceGenerator sg)
+{
+	if ((g_rtxdi.flags & RTXDI_FRAME_PRESAMPLED) == 0u || rtxdi_light_count(false) == 0u ||
+		(x.bsdf.getLobes(x.sd) & (uint)LobeType::NonDelta) == 0u || (lamps_only && rtxdi_lamps_used(false) == 0u))
+		return 0.0;
+	pt_draw d = pt_draw_init(x, lamps_only, PT_NEE_CANDIDATES, sg);
+	float3 total = 0.0;
+	[loop]
+	for (uint k = 0u; k < full; ++k)
+	{
+		pt_light chosen = (pt_light)0;
+		float2 chosen_uv = 0.0;
+		float chosen_target = 0.0, sum = 0.0;
+		[loop]
+		for (uint i = 0u; i < PT_NEE_CANDIDATES; ++i)
+		{
+			uint light;
+			float pdf;
+			const bool drawn = pt_draw_next(d, i, lamps_only, sg, light, pdf);
+			const float2 uv = sampleNext2D(sg);
+			pt_light pl;
+			if (!drawn || pt_excluded(light, ex0, ex1) || !pt_light_at(RAB_LoadLightInfo(light, false), x.sd.posW, uv, primary, s, post, pl))
+				continue;
+			float target = max(pl.E.r, max(pl.E.g, pl.E.b)) * x.bsdf.evalPdf(x.sd, pl.l, true);
+			if (target > 0.0)
+				target *= regir_vis_chance(x.sd.posW, x.sd.faceNCorrected, pl.pos);   // v100
+			const float w = target / pdf;
+			if (!(w > 0.0) || !isfinite(w))
+				continue;
+			sum += w;
+			if (sampleNext1D(sg) * sum < w)
+			{
+				chosen = pl;
+				chosen_uv = uv;
+				chosen_target = target;
+			}
+		}
+		if (!(chosen_target > 0.0))
+			continue;
+		const float vis = pt_light_shadow(chosen, chosen_uv, primary, s, origin);
+		if (!(vis > 0.0))
+			continue;
+		float3 light = pt_light_shade(x, chosen) * (vis * sum / chosen_target);
+		if (chosen.game == 0u)
+			light = pt_lamp_cap(light, post);
+		if (all(isfinite(light)))
+			total += max(light, 0.0);
+	}
+	return total / float(max(full, 1u));
+}
+
+// v106 (user, v105: "the noise is still the same" - capture rt-recon\inputs-20261015-132142: the hall's walls lit by about ten
+// comparable lamps - a bulb 1.2 m off, large dim glowing patches 2-7 m off -, one or two shadow-tested samples a pixel showing
+// one or two of them a frame: 53-61 % noise, 3-8 % of the walls black where no game light reaches): the brightest lamps at a
+// camera's surface are lit exactly, as the game's lights are (v104). PT_TOP_POOL candidates from the two sources rank the
+// lamps by their light there before shadows (RTXPT's BSDF x the visibility cache's chance); the top count (Light samples,
+// 1-8) - distinct lamps - each take their own shadow ray every frame (their light no longer a pick, the noise of the
+// pixel's main lamps gone; neighbours rank the same lamps: coherent). The rest's light: one NEE sample (or ReSTIR DI's
+// pick) with those lamps counting for nothing - unbiased: whichever lamps the ranking took (its own random numbers), the
+// exact sum plus the rest's estimate is the whole
+#define PT_TOP_POOL 12u
+void pt_lamps_top(pt_vertex x, surface s, float3 post, uint count, inout UniformSampleSequenceGenerator sg, out uint4 ex0, out uint4 ex1)
+{
+	ex0 = PT_NO_LAMP;
+	ex1 = PT_NO_LAMP;
+	if ((g_rtxdi.flags & RTXDI_FRAME_PRESAMPLED) == 0u || rtxdi_lamps_used(false) == 0u || (x.bsdf.getLobes(x.sd) & (uint)LobeType::NonDelta) == 0u)
+		return;
+	count = min(count, 8u);
+	uint ids[8];
+	float weights[8];
+	[unroll]
+	for (uint j = 0u; j < 8u; ++j)
+	{
+		ids[j] = PT_NO_LAMP;
+		weights[j] = 0.0;
+	}
+	pt_draw d = pt_draw_init(x, true, PT_TOP_POOL, sg);
+	[loop]
+	for (uint i = 0u; i < PT_TOP_POOL; ++i)
+	{
+		uint light;
+		float pdf;
+		const bool drawn = pt_draw_next(d, i, true, sg, light, pdf);
+		const float2 uv = sampleNext2D(sg);
+		pt_light pl;
+		if (!drawn || !pt_light_at(RAB_LoadLightInfo(light, false), x.sd.posW, uv, true, s, post, pl))
+			continue;
+		float w = restir_lum(pt_light_shade(x, pl));
+		if (!(w > 0.0) || !isfinite(w))
+			continue;
+		w *= regir_vis_chance(x.sd.posW, x.sd.faceNCorrected, pl.pos);
+		// into the ranking (one entry a lamp, its best weight), the weakest falls out
+		bool merged = false;
+		[unroll]
+		for (uint m = 0u; m < 8u; ++m)
+			if (!merged && ids[m] == light)
+			{
+				weights[m] = max(weights[m], w);
+				merged = true;
+			}
+		if (merged)
+			continue;
+		uint weakest = 0u;
+		[unroll]
+		for (uint m2 = 1u; m2 < 8u; ++m2)
+			if (m2 < count && weights[m2] < weights[weakest])
+				weakest = m2;
+		if (w > weights[weakest])
+		{
+			ids[weakest] = light;
+			weights[weakest] = w;
+		}
+	}
+	ex0 = uint4(ids[0], ids[1], ids[2], ids[3]);
+	ex1 = uint4(ids[4], ids[5], ids[6], ids[7]);
+}
+// The ranked lamps' light, each with its own shadow ray (a fresh point of its sphere)
+float3 pt_lamps_exact(pt_vertex x, surface s, float3 origin, float3 post, uint4 ex0, uint4 ex1, inout UniformSampleSequenceGenerator sg)
+{
+	float3 total = 0.0;
+	[loop]
+	for (uint j = 0u; j < 8u; ++j)
+	{
+		const uint light = j < 4u ? ex0[j] : ex1[j - 4u];
+		const float2 uv = sampleNext2D(sg);
+		pt_light pl;
+		if (light == PT_NO_LAMP || !pt_light_at(RAB_LoadLightInfo(light, false), x.sd.posW, uv, true, s, post, pl))
+			continue;
+		const float3 shade = pt_light_shade(x, pl);
+		if (!any(shade > 0.0))
+			continue;
+		const float3 add = pt_lamp_cap(shade * pt_light_shadow(pl, uv, true, s, origin), post);
+		if (all(isfinite(add)))
+			total += max(add, 0.0);
+	}
+	return total;
+}
+
+// v111 (as v108's): the Debug view "Lamps reference" (g_pass bit 21, tlou_rt.cpp debug view 11): every lamp of the list lit at
+// a camera's surface with its own shadow ray every frame, toward a point of its sphere - the light the estimates above (the
+// exact lamps and ReSTIR DI's pick or the NEE) average to, near noise-free (the spheres' points alone vary); a lamp whose light
+// before its shadow is under PT_LIGHT_ROULETTE takes a roulette (unbiased). Its rays are not recorded in the visibility cache.
+// Slow: a ray a lamp a pixel
+#define PT_LAMPS_REFERENCE (1u << 21)
+float3 pt_lamps_reference(pt_vertex x, surface s, float3 origin, float3 post, inout UniformSampleSequenceGenerator sg)
+{
+	float3 total = 0.0;
+	if ((x.bsdf.getLobes(x.sd) & (uint)LobeType::NonDelta) == 0u)
+		return total;
+	const uint n = rtxdi_lamps_used(false);
+	[loop]
+	for (uint i = 0u; i < n; ++i)
+	{
+		const float2 uv = sampleNext2D(sg);
+		const float ur = sampleNext1D(sg);
+		pt_light pl;
+		if (!pt_light_at(RAB_LoadLightInfo(i, false), x.sd.posW, uv, true, s, post, pl))
+			continue;
+		float3 light = pt_lamp_cap(pt_light_shade(x, pl), post);
+		const float le = restir_lum(light);
+		if (!(le > 0.0) || !isfinite(le))
+			continue;
+		if (le < PT_LIGHT_ROULETTE)
+		{
+			if (ur * PT_LIGHT_ROULETTE >= le)
+				continue;
+			light *= PT_LIGHT_ROULETTE / le;
+		}
+		const float vis = pl.tmax > 0.0 ? trace_visible(origin, pl.l, pl.tmax) : 1.0;   // (pt_light_shadow's, unrecorded)
+		total += light * vis;
+	}
+	return total;
+}
+
+// The game's lights while RTXDI's list does not hold them ("NVIDIA RTXDI game lights" off, or no presampling this frame)
+bool pt_game_by_nee()
+{
+	return (g_rtxdi.flags & (RTXDI_FRAME_PRESAMPLED | RTXDI_FRAME_GAME)) == (RTXDI_FRAME_PRESAMPLED | RTXDI_FRAME_GAME) &&
+		rtxdi_game_count(false) != 0u;
+}
+
+// HandleNEE at a bounce hit (from: off its surface): the sun (the game's shadow mask too where the camera sees the hit), one
+// of the game's lights picked uniformly x the count while RTXDI's list does not hold them, RTXPT's NEE over RTXDI's list
+// (without RTXDI's presampling this frame emitter_irradiance's picks, diffuse)
+float3 pt_nee_hit(pt_vertex x, float3 from, float3 base, float metal, inout UniformSampleSequenceGenerator sg, float3 post, bool emit_on)
+{
+	const float3 hit = x.sd.posW, nh = x.sd.faceNCorrected;
+	surface hs = hit_surface(hit, nh);
+	hs.ng = nh;
+	float3 total = 0.0;
+	const float3 sun = pt_sun_colour(hit + c[9].xyz, false, 0u);
+	const float2 xs = sampleNext2D(sg);
+	if (any(sun > 0.0) && dot(nh, c[6].xyz) > 0.0)
+	{
+		float vis;
+		const float3 add = pt_sun(x, sun, from, xs, vis);
+		if (vis > 0.0)
+		{
+			const float mask = dd2_game_sun_mask(hit, nh);
+			if (mask >= 0.0)
+				vis *= mask;
+			total += add * vis;
+		}
+	}
+	const uint count = g_lights_on != 0 && !pt_game_by_nee() ? min(Data.Load(LIGHT_LIST_COUNT), LIGHT_LIST_MAX) : 0u;
+	const float ul = sampleNext1D(sg);
+	const float2 xl = sampleNext2D(sg);
+	if (count != 0u)
+	{
+		RAB_LightInfo gi = RAB_EmptyLightInfo();
+		gi.game = Data.Load(LIGHT_LIST + min(uint(ul * count), count - 1u) * 4) + 1u;
+		pt_light pl;
+		if (pt_light_at(gi, hit, xl, false, hs, post, pl))
+		{
+			const float3 light = pt_light_shade(x, pl);
+			if (any(light > 0.0))
+				total += light * (float(count) * pt_light_shadow(pl, xl, false, hs, from));
+		}
+	}
+	if ((g_rtxdi.flags & RTXDI_FRAME_PRESAMPLED) != 0u)
+		total += pt_nee(x, false, hs, from, post, 1u, false, PT_NO_LAMP, PT_NO_LAMP, sg);   // (RTXPT's NEEFullSamples 1 at the bounces)
+	else if (emit_on)
+		total += base * (1.0 - metal) * (0.31830989 * g_emit) * emitter_irradiance(hit, nh, nh, sg.Next()) / post;
+	return all(isfinite(total)) ? max(total, 0.0) : 0.0;
+}
+
+// v101: the closest cut-out card up to tmax, solid (its mask left out) - rt.hlsl trace_scene over the cards (MASK_CUTOUT)
+scene_hit pt_trace_cards(float3 origin, float3 dir, float tmax)
+{
+	RayDesc ray;
+	ray.Origin = origin + c[9].xyz;
+	ray.TMin = 0.0;
+	ray.Direction = dir;
+	ray.TMax = tmax;
+	RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, MASK_CUTOUT, ray);
+	q.Proceed();
+	scene_hit h;
+	h.hit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+	h.t = h.hit ? q.CommittedRayT() : tmax;
+	h.draw = h.hit ? q.CommittedInstanceID() : 0u;
+	h.primitive = h.hit ? q.CommittedPrimitiveIndex() : 0u;
+	return h;
+}
+
+// The primary vertex of a camera pixel (d: its depth, the sky not): its surface - hair facing the viewer -, the triangle's
+// normal, where its rays start, the lobes' albedos the indirect light is stored demodulated by, RTXPT's vertex there. v111:
+// out of cs_rtxpt_path unchanged, for cs_rtxpt_rank too
+void pt_primary(uint2 px, float d, out surface s, out float3 ng, out float3 origin, out float3 alb_d, out float3 alb_s, out float3 alb_f0,
+	out pt_vertex x0)
+{
+	const bool hair = (pixel_flags(px) & PIXEL_HAIR) != 0;
+	s = load_surface(px, d);
+	if (hair)
+		face_viewer(s);
+	// the primary (RTXPT: the camera ray's first hit; here the G-buffer's surface, its end re-traced against the BVH as both
+	// renderers re-trace it - DD2's RecastPrimaryRays): the triangle's position and normal
+	ng = hair ? s.n : geometric_normal(px, s.p, s.n);
+	if (!hair)
+	{
+		const float dist = length(s.p);
+		const float3 dir = s.p / max(dist, 1e-6);
+		const float window = RE9_RECAST + dist * 0.01;
+		const float start = max(dist - max(window, RE9_RECAST_FRONT + dist * 0.05), 0.0);
+		scene_hit h = trace_scene(dir * start, dir, dist + window - start);
+		float t = start + h.t;
+		// v101 (user: "black fix did not work", captures rt-recon\inputs-20261015-074907 / -074915: two posters pure black in
+		// this renderer - 99.5 % of their pixels 0 - and lit in RE9's): a cut-out card at the depth buffer's surface (posters,
+		// signs, decals: the camera sees it there) is the primary. The recast's opaque scene leaves the cards out and took the
+		// wall a few millimetres behind the poster, so every ray of the path started between the card and the wall under its
+		// back - the card's mask blocked them all. A card within 2 mm + 0.05 % of the depth counts as solid there (its mask
+		// may disagree with what the game drew)
+		const float tight = 0.002 + dist * 0.0005, card_start = max(dist - tight, 0.0);
+		const scene_hit hc = pt_trace_cards(dir * card_start, dir, dist + tight - card_start);
+		if (hc.hit && (!h.hit || card_start + hc.t < t))
+		{
+			h = hc;
+			t = card_start + hc.t;
+		}
+		if (h.hit)
+		{
+			s.p = dir * t;
+			const float3 nt = hit_normal(h.draw, h.primitive);
+			ng = dot(nt, dir) > 0.0 ? -nt : nt;
+		}
+	}
+	origin = s.p + ng * (DD2_EPS + length(s.p) * 0.0005);
+	s.ng = ng;                                              // (v99: the visibility cache's records)
+	// the lobes' albedos the indirect light is stored demodulated by (re9_albedos: the composite's, from the G-buffer's normal)
+	re9_albedos(s, alb_d, alb_s, alb_f0);
+	s.n = visible_normal(s.n, s.v, ng);                     // (v58: the normal maps' normal lifted onto the triangle's side)
+	x0 = pt_vertex_make(s.p, s.v, s.n, ng, s.albedo, s.metallic, s.spec * (0.08 / 255.0), s.roughness);
+}
+
+// v111 (user, v110: "go back to v106 ... its where things got nearly perfect"; then: "v106, shadows are right, they are almost
+// the same as the lamp reference ... the ONLY issue is small noise"; its lamp view rt-recon\inputs-20261015-133736: the walls in
+// two levels - ReSTIR DI's pick for the rest of the lamps was one of the lamps lit exactly about 30 % of the time, its light
+// then counted for nothing, else about the lamps' whole light): each camera pixel's exact lamps chosen before ReSTIR DI runs
+// (tlou_rt.cpp: while ReSTIR DI (RTXPT) runs) - v106's ranking (pt_lamps_top) at the vertex cs_rtxpt_path builds, its own
+// random numbers - and stored (rtxdi_bridge.hlsli rtxdi_exact_at) for both: ReSTIR DI's target skips them, so its pick is
+// always one of the rest; cs_rtxpt_path lights them each with its own ray as v106 did (g_pass bit 20). A lamp without a slot
+// in the lamps' memory is left to ReSTIR DI (its target could not skip it). g_pass: cs_rtxpt_path's
+#define PT_PASS_RANKED (1u << 20)
+[numthreads(8, 8, 1)]
+void cs_rtxpt_rank(uint3 id : SV_DispatchThreadID)
+{
+	const uint2 size = full_size();
+	if (id.x >= size.x || id.y >= size.y)
+		return;
+	uint4 ids = 0u, lists = 0u;
+	const float d = Depth[id.xy];
+	if (d < 1.0)
+	{
+		surface s;
+		float3 ng, origin, alb_d, alb_s, alb_f0;
+		pt_vertex x0;
+		pt_primary(id.xy, d, s, ng, origin, alb_d, alb_s, alb_f0, x0);
+		const float3 post = max(lighting_factor(id.xy, d) * g_brightness, 1e-4);
+		UniformSampleSequenceGenerator sg = UniformSampleSequenceGenerator::make(SampleGeneratorVertexBase::make(PathIDFromPixel(id.xy), 1u, g_frame),
+			SampleGeneratorEffectSeed::NextEventEstimationLightSampler);
+		uint4 ex0, ex1;
+		pt_lamps_top(x0, s, post, pt_light_samples(), sg, ex0, ex1);
+		[unroll]
+		for (uint j = 0u; j < 8u; ++j)
+		{
+			const uint light = j < 4u ? ex0[j] : ex1[j - 4u];
+			const uint lamp = light != PT_NO_LAMP ? RAB_LoadLightInfo(light, false).lamp : 0u;
+			if (lamp == 0u || lamp > 0xFFFFu || light >= 0xFFFFu)
+				continue;
+			ids[j >> 1] |= lamp << ((j & 1u) * 16u);
+			lists[j >> 1] |= (light + 1u) << ((j & 1u) * 16u);
+		}
+	}
+	const uint at = rtxdi_exact_at(g_frame & 1u, id.xy);
+	Data.Store4(at, ids);
+	Data.Store4(at + 16u, lists);
+}
+
+[numthreads(8, 8, 1)]
+void cs_rtxpt_path(uint3 id : SV_DispatchThreadID)
+{
+	const uint2 size = full_size();
+	if (id.x >= size.x || id.y >= size.y)
+		return;
+	const float d = Depth[id.xy];
+	if (d >= 1.0)
+	{
+		re9_store(RE9_RAW_D, id.xy, 0.0);                  // the sky: untouched
+		re9_store(RE9_RAW_S, id.xy, 0.0);
+		re9_store(RE9_DIRECT, id.xy, 0.0);
+		re9_store(RE9_DIRECT_D, id.xy, 0.0);
+		return;
+	}
+	surface s;
+	float3 ng, origin, alb_d, alb_s, alb_f0;
+	pt_vertex x0;
+	pt_primary(id.xy, d, s, ng, origin, alb_d, alb_s, alb_f0, x0);   // (v111: shared with cs_rtxpt_rank)
+	const uint4 g1 = GBuffer1[id.xy];
+	const float2 uv = (float2(id.xy) + 0.5) * c[8].zw;
+	const float3 post = max(lighting_factor(id.xy, d) * g_brightness, 1e-4);
+	const bool emit_on = g_emit > 0.0 && Data.Load(emit_list_offset() + 8) != 0u;
+	const float3 a4 = InT4[id.xy].rgb, a5 = InT5[id.xy].rgb;   // the game's baked ambient at the pixel (the sky's stand-in)
+	const float3 axis = decode_ambient_direction(g1);
+	const uint path = PathIDFromPixel(id.xy);
+
+	// ---- next-event estimation at the primary ----
+	UniformSampleSequenceGenerator sg = UniformSampleSequenceGenerator::make(SampleGeneratorVertexBase::make(path, 1u, g_frame),
+		SampleGeneratorEffectSeed::NextEventEstimation);
+	float3 direct = 0.0;
+	float3 lamps = 0.0;                                    // the lights through RTXDI apart (the debug views)
+	{
+		// the sun under the game's shadow mask at the pixel (both renderers' since v97: the casters the scene lacks)
+		const float3 sun = pt_sun_colour(s.p + c[9].xyz, s.character, s.stencil);
+		const float2 xs = sampleNext2D(sg);
+		if (any(sun > 0.0) && dot(ng, c[6].xyz) > 0.0)
+		{
+			float vis;
+			const float3 add = pt_sun(x0, sun, origin, xs, vis) * (vis * saturate(sun_factor(s, g1, id.xy, uv) * InT10.SampleLevel(SamplerS0, uv, 0.0).x));
+			if (all(isfinite(add)))
+				direct += max(add, 0.0);
+		}
+		// every game light of the frame (cs_light_census' list) as an RTXPT sphere light with its own shadow (v99: its sampled
+		// point; v52-v98 the shading toward its centre). v104 (user, v103: "nice, shadows back, but the image is very noisy
+		// now"): whether RTXDI's list holds them or not - each light every frame, its shadow map and its ray: crisp shadows of
+		// every one without a light picked at random (v99-v103: while RTXDI's list held them, one or two picks among all the
+		// lights, ReSTIR DI's or RTXPT's NEE - noise, or shadows Ray Reconstruction averaged out); RTXDI and the NEE below take
+		// the lamps alone (RTXDI_FRAME_EXACT_GAME). A light whose light before its shadow is under PT_LIGHT_ROULETTE takes its
+		// shadow with that share of chances, x its inverse (unbiased: the far ones of Physical light falloff cost few rays)
+		const uint count = g_lights_on != 0 ? min(Data.Load(LIGHT_LIST_COUNT), LIGHT_LIST_MAX) : 0u;
+		[loop]
+		for (uint i = 0; i < count; ++i)
+		{
+			RAB_LightInfo gi = RAB_EmptyLightInfo();
+			gi.game = Data.Load(LIGHT_LIST + i * 4) + 1u;
+			const float2 xi = sampleNext2D(sg);
+			const float ur = sampleNext1D(sg);
+			pt_light pl;
+			if (!pt_light_at(gi, s.p, xi, true, s, post, pl))
+				continue;
+			float3 light = pt_light_shade(x0, pl);
+			const float le = restir_lum(light);
+			if (!(le > 0.0))
+				continue;
+			if (le < PT_LIGHT_ROULETTE)
+			{
+				if (ur * PT_LIGHT_ROULETTE >= le)
+					continue;
+				light *= PT_LIGHT_ROULETTE / le;
+			}
+			const float3 add = light * pt_light_shadow(pl, xi, true, s, origin);
+			if (all(isfinite(add)))
+				direct += max(add, 0.0);
+		}
+		// the lamps of RTXDI's list (v99-v103 the game's lights too while it held them): v99 - NVIDIA RTXDI's ReSTIR DI pick
+		// (g_pass bit 4: cs_rtxdi_di ran - v103 by ReSTIR DI (RTXPT): always by default, or while Ray Reconstruction does not
+		// denoise; v99-v102 only then) shaded with RTXPT's BSDF and the light's
+		// sphere (its uv's point, its own shadow; x the reservoir's 1 / pdf, clamped as cs_rtxdi_di clamps), else RTXPT's NEE
+		// (as RTXPT with DLSS-RR: DisableReSTIRsWithDLSSRR); without RTXDI's presampling this frame emitter_irradiance's picks.
+		// v100: two full samples there (RTXPT's NEEFullSamples - the camera's surfaces without ReSTIR DI's reuse); v101: Light
+		// samples. v106: first the brightest lamps there, each lit exactly (Light samples of them: pt_lamps_top / _exact), then
+		// the rest's light - one NEE sample or ReSTIR DI's pick, the exact ones counting for nothing in either. v111: with ReSTIR
+		// DI the exact lamps as cs_rtxpt_rank chose them before it ran (g_pass bit 20) - its pick then never one of them; the
+		// Debug view "Lamps reference" every lamp with its own ray in place of all of them (pt_lamps_reference)
+		const bool reference = (g_pass & PT_LAMPS_REFERENCE) != 0u;
+		uint4 ex0 = PT_NO_LAMP, ex1 = PT_NO_LAMP;
+		float3 exact = 0.0;
+		if (!reference && ((g_pass & PT_PASS_RANKED) != 0u || (g_rtxdi.flags & RTXDI_FRAME_PRESAMPLED) != 0u))
+		{
+			if ((g_pass & PT_PASS_RANKED) != 0u)
+			{
+				const uint4 lists = Data.Load4(rtxdi_exact_at(g_frame & 1u, id.xy) + 16u);   // (list index + 1: 0 - 1 = PT_NO_LAMP)
+				const uint4 lo = lists & 0xFFFFu, hi = lists >> 16;
+				ex0 = uint4(lo.x, hi.x, lo.y, hi.y) - 1u;
+				ex1 = uint4(lo.z, hi.z, lo.w, hi.w) - 1u;
+			}
+			else
+				pt_lamps_top(x0, s, post, pt_light_samples(), sg, ex0, ex1);
+			exact = pt_lamps_exact(x0, s, origin, post, ex0, ex1, sg);
+		}
+		if (reference)
+			lamps = pt_lamps_reference(x0, s, origin, post, sg);
+		else if ((g_pass & 16u) != 0u)
+		{
+			const RTXDI_DIReservoir r = RTXDI_LoadDIReservoir(g_rtxdi.reservoirs, id.xy, g_rtxdi.output);
+			const float2 ruv = RTXDI_GetDIReservoirSampleUV(r);
+			const float W = RTXDI_GetDIReservoirInvPdf(r);
+			const uint rl = RTXDI_GetDIReservoirLightIndex(r);
+			pt_light pl;
+			if (RTXDI_IsValidDIReservoir(r) && W > 0.0 && !pt_excluded(rl, ex0, ex1) &&
+				pt_light_at(RAB_LoadLightInfo(rl, false), s.p, ruv, true, s, post, pl) && pl.game == 0u)
+			{
+				float3 add = pt_light_shade(x0, pl);
+				if (any(add > 0.0))
+					add *= pt_light_shadow(pl, ruv, true, s, origin) * W;
+				float le = restir_lum(add * post);
+				const float cap = 0.31830989 * g_emit * EMIT_MAX_IRRADIANCE;
+				if (pl.game == 0u && le > cap)
+					add *= cap / le;
+				le = restir_lum(add);
+				if (le > DI_MAX)
+					add *= DI_MAX / le;
+				lamps = add;
+			}
+		}
+		else if ((g_rtxdi.flags & RTXDI_FRAME_PRESAMPLED) != 0u)
+			lamps = pt_nee(x0, true, s, origin, post, 1u, true, ex0, ex1, sg);   // (v104: the lamps alone; v106: but the exact ones)
+		else if (emit_on)
+			lamps = alb_d * (0.31830989 * g_emit) * emitter_irradiance(s.p, s.n, ng, sg.Next()) / post;
+		lamps = all(isfinite(lamps)) ? max(lamps, 0.0) : 0.0;
+		lamps += exact;
+		direct += lamps;
+	}
+
+	// ---- the path: RTXPT's loop from the primary on ----
+	const uint diffuse_limit = clamp(g_pass & 7u, 1u, 7u);   // RTXPT's DiffuseBounceCount (the Bounces setting)
+	float3 thp = 1.0;                                      // the throughput past the primary's sample
+	float3 lind = 0.0;                                     // the light arriving at the primary along its sample
+	float3 w0 = 0.0, w_d = 0.0, w_s = 0.0;                 // the primary's sample weight; demodulated: diffuse / Ad, specular / As
+	float first_t = 0.0;
+	float source = 0.0;                                    // the first bounce's light (the debug view): 2 a hit, 3 the sky
+	uint diffuse_bounces = 0u;
+	pt_vertex x = x0;
+	float3 o = origin;
+	[loop]
+	for (uint vertex = 1u; vertex <= PT_BOUNCE_COUNT; ++vertex)
+	{
+		// GenerateScatterRay: RTXPT's BSDF sample at the vertex - quasi-random until the first diffuse bounce
+		// (DisableLowDiscrepancySamplingAfterDiffuseBounceCount), hashed after
+		const SampleGeneratorVertexBase vb = SampleGeneratorVertexBase::make(path, vertex, g_frame);
+		const float4 u = diffuse_bounces < DisableLowDiscrepancySamplingAfterDiffuseBounceCount ?
+			SampleSequenceGenerator::Generate(StandardBSDF::cRandomNumberCountForSampling, vb, SampleGeneratorEffectSeed::ScatterBSDF) :
+			UniformSampleSequenceGenerator::Generate(StandardBSDF::cRandomNumberCountForSampling, vb, SampleGeneratorEffectSeed::ScatterBSDF);
+		BSDFSample bs;
+		if (!x.bsdf.sample(x.sd, u, bs, true))
+			break;
+		if (vertex == 1u)
+		{
+			w0 = bs.weight;
+			if (bs.isLobe(LobeType::DiffuseReflection))
+				w_d = bs.weight / max(alb_d, 1e-4);
+			else
+				w_s = bs.weight / max(alb_s, 1e-4);
+			if (!all(isfinite(w_d)) || !all(isfinite(w_s)))
+				break;
+		}
+		else
+			thp *= bs.weight;
+		if (bs.isLobe(LobeType::Diffuse) || (float)x.bsdf.data.Roughness() > PT_SPECULAR_ROUGHNESS)
+			++diffuse_bounces;
+		// HasFinishedSurfaceBounces, then HandleRussianRoulette (a milder version of Falcor's: the termination chance
+		// (0.85 - sqrt(luminance(throughput)))^2, + the share of the bounce limit past 40 %); a path stopped either way still
+		// traces this ray for what it finds (the sky), the survivors' throughput / the survival chance from the next vertex on
+		bool stop = vertex + 1u > PT_BOUNCE_COUNT || diffuse_bounces > diffuse_limit;
+		float survival = 1.0;
+		if (!stop)
+		{
+			float prob = saturate(0.85 - sqrt(Luminance(w0 * thp)));
+			prob = saturate(prob * prob + max(0.0, float(vertex) / float(PT_BOUNCE_COUNT) - 0.4));
+			UniformSampleSequenceGenerator rr = UniformSampleSequenceGenerator::make(vb, SampleGeneratorEffectSeed::RussianRoulette);
+			if (sampleNext1D(rr) < prob)
+				stop = true;
+			else
+				survival = 1.0 - prob;
+		}
+		if (!any(thp > 0.0) || !all(isfinite(thp)))
+			break;
+		// the scatter ray (cut-out cards alpha-tested; DD2's 1000 m)
+		const scene_hit hh = trace_cutouts(o, bs.wo, DD2_TMAX);
+		if (vertex == 1u)
+			first_t = hh.t;
+		if (!hh.hit)
+		{
+			// HandleMiss: the sky (the add-on's open sky / the game's baked ambient by Baked light) x Sky light
+			lind += thp * dd2_escaped(id.xy, bs.wo, a4, a5, axis, 1.0, 1.0) * g_sky;
+			if (vertex == 1u)
+				source = 3.0;
+			break;
+		}
+		if (vertex == 1u)
+			source = 2.0;
+		if (stop)                                           // (RTXPT takes the hit's emission first - TLOU's scene has none)
+			break;
+		thp /= survival;
+		// HandleHit: the hit's vertex - the triangle's normal toward the ray (two-sided), the material cache's material (albedo,
+		// roughness - 0.5 where none is known yet - metalness, the dielectric's F0: rt.hlsl hit_material / hit_material_pbr)
+		const float3 hit = o + bs.wo * hh.t;
+		float3 nh = hit_normal(hh.draw, hh.primitive);
+		if (dot(nh, bs.wo) > 0.0)
+			nh = -nh;
+		const float4 m = hit_material(hh.draw, hh.primitive);
+		const float2 mp = hit_material_pbr(hh.draw, hh.primitive);
+		const float rough = m.w >= 0.0 ? m.w : 0.5;
+		x = pt_vertex_make(hit, -bs.wo, nh, nh, m.rgb, mp.x, mp.y, rough);
+		o = hit + nh * (DD2_EPS + length(hit) * 0.0005);
+		// HandleNEE (a vertex with a non-delta lobe)
+		if ((x.bsdf.getLobes(x.sd) & (uint)LobeType::NonDelta) != 0u)
+		{
+			UniformSampleSequenceGenerator sgh = UniformSampleSequenceGenerator::make(SampleGeneratorVertexBase::make(path, vertex + 1u, g_frame),
+				SampleGeneratorEffectSeed::NextEventEstimation);
+			lind += thp * pt_nee_hit(x, o, m.rgb, mp.x, sgh, post, emit_on);
+		}
+	}
+	if (!all(isfinite(lind)))                               // (RTXPT's ValidateNaNs)
+		lind = 0.0;
+	// the indirect light, demodulated per lobe; a sample's luminance limited to RE9_MAX as both renderers limit it
+	float3 sd = lind * w_d, ss = lind * w_s;
+	const float li = restir_lum(sd + ss);
+	if (!(li <= RE9_MAX))
+	{
+		const float k = li > RE9_MAX ? RE9_MAX / li : 0.0;
+		sd *= k;
+		ss *= k;
+	}
+	re9_store(RE9_DIRECT, id.xy, float4(max(direct, 0.0), 1.0));   // w: no contact ray
+	re9_store(RE9_DIRECT_D, id.xy, 0.0);                    // no subsurface blur
+	re9_store(RE9_RAW_D, id.xy, float4(max(sd, 0.0), source));   // w: the first bounce's light (the debug view)
+	re9_store(RE9_RAW_S, id.xy, float4(max(ss, 0.0), first_t));   // w: the first hit's distance (RR's specular guide)
+	re9_store(RE9_SSS_E, id.xy, float4(lamps, 0.0));        // the debug views' terms: the lights through RTXDI; the sun and the
+	re9_store(RE9_SSS_H, id.xy, float4(max(direct - lamps, 0.0), source));   //   game's lights of the per-light loop
+}
+
+// The light buffer (v52-v97 dd2.hlsl cs_dd2_composite, as is but the game's occlusion - v97 removed it): the direct light +
+// the accumulated indirect light by the lobes' albedos again (Ad x diffuse x Bounce light + As x specular), the pixel's own
+// glow, by the lighting's factor and Brightness, blended over the game's result by Path tracing; the game's own result kept
+// for the forward relight (cs_re9_ratio); the Bounce slider's extra in RE9_BOOST for the history. RR denoising in the game:
+// this frame's noisy light (rr_noisy_light), the accumulated light kept for the history (RE9_SETTLED)
+[numthreads(8, 8, 1)]
+void cs_rtxpt_composite(uint3 id : SV_DispatchThreadID)
+{
+	const uint2 size = full_size();
+	if (id.x >= size.x || id.y >= size.y)
+		return;
+	const float d = Depth[id.xy];
+	if (d >= 1.0)
+	{
+		re9_store(RE9_BOOST, id.xy, 0.0);
+		return;
+	}
+	const uint cur = g_frame & 1u;
+	surface s = load_surface(id.xy, d);
+	if ((pixel_flags(id.xy) & PIXEL_HAIR) != 0)
+		face_viewer(s);
+	float3 ad, as, f0;
+	re9_albedos(s, ad, as, f0);
+	const float4 direct = re9_load(RE9_DIRECT, id.xy);
+	const float3 indirect = ad * max(re9_load(RE9_ACC_D + cur, id.xy).rgb, 0.0);
+	const float3 specular = as * max(re9_load(RE9_ACC_S + cur, id.xy).rgb, 0.0);
+	float3 total = max(direct.rgb, 0.0) + indirect * g_bounce + specular;
+	const bool noisy = g_pass == 0 && (rr_load_block().flags & RR_NOISY) != 0u;
+	const float3 settled = total;
+	float3 rr_light;
+	if (noisy)
+		total = rr_noisy_light(id.xy, ad, as);
+	else if (g_pass == 0 && rr_reprojected(id.xy, d, decode_normal(GBuffer0[id.xy]), (pixel_flags(id.xy) & PIXEL_HAIR) != 0, rr_light))
+		total = rr_light;
+	// the Debug view (g_pass): 1 the direct light alone, 2 the indirect light alone, 3 each pixel's first bounce (red a hit,
+	// blue the sky), 4 the lights through RTXDI alone, 5 the sun and the game's lights alone, 6 the contact ray's visibility
+	// (white: none in this renderer), 7 this frame's bounce, 8-9 SHaRC's light and voxels
+	if (g_pass == 1)
+		total = max(direct.rgb, 0.0);
+	else if (g_pass == 2)
+		total = indirect * g_bounce + specular;
+	else if (g_pass == 4)
+		total = re9_load(RE9_SSS_E, id.xy).rgb;
+	else if (g_pass == 5)
+		total = re9_load(RE9_SSS_H, id.xy).rgb;
+	else if (g_pass == 7)
+		total = re9_bounce_now(id.xy, ad, as);
+	else if (g_pass == 8)
+		total = sharc_debug_light(id.xy, d);
+	else if (g_pass == 3 || g_pass == 6 || g_pass == 9)
+	{
+		const float code = re9_load(RE9_RAW_D, id.xy).w;
+		re9_store(RE9_BOOST, id.xy, 0.0);
+		Light[id.xy] = float4(g_pass == 9 ? sharc_debug_voxels(id.xy, d) : g_pass == 6 ? saturate(direct.w) : code == 1.0 ? float3(0.0, 0.6, 0.0) :
+			code == 2.0 ? float3(0.6, 0.0, 0.0) : code == 3.0 ? float3(0.0, 0.0, 0.6) : code == 4.0 ? float3(0.6, 0.6, 0.0) : 0.05, 1.0);
+		return;
+	}
+	const float3 gain = lighting_factor(id.xy, d) * g_brightness;
+	const float3 self = g_pass == 0 ? emission_at(id.xy) : 0.0;
+	const float3 game = Light[id.xy].rgb;
+	Data.Store(relight_gp_offset() + (id.y * size.x + id.x) * 8, pack_r11g11b10(game));
+	const bool valid = all(isfinite(total)) && all(isfinite(gain));
+	Light[id.xy] = float4(lerp(game, valid ? total * gain + self : game, g_full), 1.0);
+	re9_store(RE9_BOOST, id.xy, valid ? float4(indirect * max(g_bounce * gain - min(gain, 1.0), 0.0) * g_full + self * g_full, 0.0) : 0.0);
+	if (noisy)
+		re9_store(RE9_SETTLED, id.xy, float4(lerp(game, valid && all(isfinite(settled)) ? settled * gain + self : game, g_full), 0.0));
+}
